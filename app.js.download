@@ -1,0 +1,1047 @@
+(function(){
+'use strict';
+
+/* =====================================================================
+   Keenly, written with object-oriented programming.
+
+   Concepts used
+   - Encapsulation   : private fields and methods (#name) in Subject, Person,
+                       RemoteStore and ClassroomService.
+   - Abstraction     : Person (abstract), and the two stores share one
+                       save() contract that the rest of the app relies on.
+   - Inheritance     : Student and Teacher extend Person; ClassTask extends Task.
+   - Polymorphism    : landing(), tourSteps(), canDelete(), toggle(), badges()
+                       and contextLabel() behave differently in each subclass.
+   - Composition     : a GradeBook owns Subjects and Tasks; a Subject owns
+                       Assessments; App owns a service and a store.
+   ===================================================================== */
+
+const CATS = ['Quiz', 'Activity', 'Project', 'Exam'];
+const $ = (id) => document.getElementById(id);
+const uid = () => Math.random().toString(36).slice(2, 10);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const clone = (o) => JSON.parse(JSON.stringify(o));
+
+/* ---------- utilities ---------- */
+
+class Dates {
+  static iso(d) { const m = d.getMonth() + 1, x = d.getDate(); return `${d.getFullYear()}-${m < 10 ? '0' : ''}${m}-${x < 10 ? '0' : ''}${x}`; }
+  static plus(n) { const d = new Date(); d.setDate(d.getDate() + n); return Dates.iso(d); }
+  static today() { return Dates.iso(new Date()); }
+  static daysTo(s) { return Math.round((new Date(s + 'T00:00:00') - new Date(Dates.today() + 'T00:00:00')) / 864e5); }
+  static short(s) { return new Date(s + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); }
+}
+
+class Hasher {
+  static async sha(text) {
+    if (window.crypto && crypto.subtle && window.TextEncoder) {
+      const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return Array.from(new Uint8Array(d)).map((x) => ('0' + x.toString(16)).slice(-2)).join('');
+    }
+    let h = 5381, g = 52711;
+    for (let i = 0; i < text.length; i++) { h = ((h * 33) ^ text.charCodeAt(i)) >>> 0; g = ((g * 31) + text.charCodeAt(i)) >>> 0; }
+    return 'x' + h.toString(16) + g.toString(16);
+  }
+  static pin(id, pin) { return Hasher.sha(`${id}:pin:${pin}`); }
+  static num(id, num) { return Hasher.sha(`${id}:num:${num}`); }
+}
+
+/* ---------- model: grades ---------- */
+
+class Assessment {
+  constructor({ id, cat, name, score, total }) {
+    this.id = id || uid(); this.cat = cat; this.name = name; this.score = +score; this.total = +total;
+  }
+  get percent() { return this.total > 0 ? this.score / this.total * 100 : null; }
+  toJSON() { return { id: this.id, cat: this.cat, name: this.name, score: this.score, total: this.total }; }
+}
+
+class Subject {
+  #items;
+  constructor({ id, name, units, weights, items = [], target }) {
+    this.id = id || uid();
+    this.name = name;
+    this.units = units || 3;
+    this.weights = Object.assign({ Quiz: 20, Activity: 20, Project: 20, Exam: 40 }, weights);
+    this.target = target || 0;
+    this.#items = items.map((i) => new Assessment(i));
+  }
+  get items() { return this.#items.slice(); }
+  addItem(data) { const a = new Assessment(data); this.#items.push(a); return a; }
+  removeItem(id) { this.#items = this.#items.filter((i) => i.id !== id); }
+  setWeight(cat, value) { this.weights[cat] = Math.max(0, +value || 0); }
+  get weightTotal() { return CATS.reduce((s, c) => s + (+this.weights[c] || 0), 0); }
+  #scored(cat) { return this.#items.filter((i) => i.cat === cat && i.total > 0); }
+
+  grade() {
+    const total = this.weightTotal;
+    let cur = 0, done = 0, left = 0;
+    for (const c of CATS) {
+      const w = +this.weights[c] || 0, its = this.#scored(c);
+      if (its.length) {
+        const avg = its.reduce((s, x) => s + x.score, 0) / its.reduce((s, x) => s + x.total, 0) * 100;
+        cur += avg * w; done += w;
+      } else left += w;
+    }
+    if (total <= 0 || done <= 0) return { pct: null, pts: 0, left: total > 0 ? left / total : 0, total };
+    return { pct: cur / done, pts: cur / total, left: left / total, total };
+  }
+  categoryAverages() {
+    return CATS.map((c) => {
+      const its = this.#scored(c);
+      const avg = its.length ? its.reduce((s, x) => s + x.score, 0) / its.reduce((s, x) => s + x.total, 0) * 100 : null;
+      return { cat: c, avg, weight: +this.weights[c] || 0, count: its.length };
+    });
+  }
+  get percent() { return this.grade().pct; }
+  get equivalent() { return Subject.equivalent(this.percent); }
+
+  needed(target) {
+    const r = this.grade();
+    if (r.total <= 0) return { state: 'noweights' };
+    const names = CATS.filter((c) => (+this.weights[c] || 0) > 0 && !this.#scored(c).length);
+    if (r.left <= 0.0001) return { state: 'complete', final: r.pts, met: r.pts >= target };
+    const need = (target - r.pts) / r.left;
+    if (need <= 0) return { state: 'reached', names };
+    return { state: need > 100 ? 'impossible' : 'ok', need, names };
+  }
+
+  static equivalent(p) {
+    if (p == null) return '–';
+    const r = Math.round(p);
+    if (r >= 97) return '1.00'; if (r >= 94) return '1.25'; if (r >= 91) return '1.50'; if (r >= 88) return '1.75';
+    if (r >= 85) return '2.00'; if (r >= 82) return '2.25'; if (r >= 79) return '2.50'; if (r >= 76) return '2.75';
+    if (r >= 75) return '3.00';
+    return '5.00';
+  }
+  toJSON() {
+    return { id: this.id, name: this.name, units: this.units, weights: this.weights, target: this.target, items: this.#items.map((i) => i.toJSON()) };
+  }
+}
+
+/* ---------- model: tasks (inheritance + polymorphism) ---------- */
+
+class Task {
+  constructor({ id, title, subjectId, due, priority, done }) {
+    this.id = id || uid(); this.title = title; this.subjectId = subjectId || '';
+    this.due = due; this.priority = priority || 'Normal'; this.done = !!done;
+  }
+  get daysLeft() { return Dates.daysTo(this.due); }
+  get isLate() { return !this.done && this.daysLeft < 0; }
+  whenLabel() {
+    const d = this.daysLeft, n = Math.abs(d);
+    if (d < 0) return `${n} day${n === 1 ? '' : 's'} late`;
+    if (d === 0) return 'Due today';
+    if (d === 1) return 'Due tomorrow';
+    return 'Due ' + Dates.short(this.due);
+  }
+  contextLabel(book) { return book.subjectName(this.subjectId); }
+  badges() { return this.priority !== 'Normal' ? [{ text: this.priority, cls: this.priority === 'High' ? 'high' : '' }] : []; }
+  canDelete() { return true; }
+  toggle(done) { this.done = done; }
+  toJSON() { return { id: this.id, title: this.title, subjectId: this.subjectId, due: this.due, priority: this.priority, done: this.done }; }
+}
+
+/** An assignment posted by the teacher. It is shown in a student's list but is not owned by the student. */
+class ClassTask extends Task {
+  constructor(assignment, book) {
+    super({ id: 'a:' + assignment.id, title: assignment.title, due: assignment.due, done: !!book.aDone[assignment.id] });
+    this.assignment = assignment;
+  }
+  contextLabel() { return this.assignment.subject || 'Class'; }
+  badges() { return [{ text: 'Class', cls: 'cls' }, ...super.badges()]; }
+  canDelete() { return false; }
+  toggle(done, book) { book.aDone[this.assignment.id] = done; this.done = done; }
+}
+
+class GradeBook {
+  constructor({ example = false, subjects = [], tasks = [], aDone = {} } = {}) {
+    this.example = example;
+    this.subjects = subjects.map((s) => new Subject(s));
+    this.tasks = tasks.map((t) => new Task(t));
+    this.aDone = Object.assign({}, aDone);
+  }
+  static empty() { return new GradeBook(); }
+  static fromJSON(o) { return new GradeBook(o || {}); }
+  /** The grades (written by the teacher) and the to-do part (written by the student) live in separate documents. */
+  static fromParts(grades, todo) {
+    return new GradeBook({ subjects: (grades && grades.subjects) || [], tasks: (todo && todo.tasks) || [], aDone: (todo && todo.aDone) || {} });
+  }
+  gradesJSON() { return { subjects: this.subjects.map((s) => s.toJSON()) }; }
+  todoJSON() { return { tasks: this.tasks.map((t) => t.toJSON()), aDone: this.aDone }; }
+  subject(id) { return this.subjects.find((s) => s.id === id); }
+  subjectName(id) { const s = this.subject(id); return s ? s.name : ''; }
+  clearExample() { if (this.example) { this.subjects = []; this.tasks = []; this.example = false; } }
+  addSubject(name, units) { const s = new Subject({ name, units: Math.max(1, +units || 3) }); this.subjects.push(s); return s; }
+  removeSubject(id) { this.subjects = this.subjects.filter((s) => s.id !== id); this.tasks.forEach((t) => { if (t.subjectId === id) t.subjectId = ''; }); }
+  addTask(data) { const t = new Task(data); this.tasks.push(t); return t; }
+  removeTask(id) { this.tasks = this.tasks.filter((t) => t.id !== id); }
+  tasksWith(assignments) { return [...this.tasks, ...assignments.map((a) => new ClassTask(a, this))]; }
+  gwa() {
+    let num = 0, den = 0;
+    for (const s of this.subjects) { if (s.percent != null) { num += parseFloat(s.equivalent) * s.units; den += s.units; } }
+    return { value: den ? num / den : null, units: den };
+  }
+  toJSON() { return { example: this.example, subjects: this.subjects.map((s) => s.toJSON()), tasks: this.tasks.map((t) => t.toJSON()), aDone: this.aDone }; }
+}
+
+/* ---------- model: people (abstraction, inheritance, encapsulation) ---------- */
+
+class Person {
+  #id; #name;
+  constructor({ id, name }) {
+    if (new.target === Person) throw new TypeError('Person is abstract');
+    this.#id = id; this.#name = name;
+  }
+  get id() { return this.#id; }
+  get name() { return this.#name; }
+  get role() { throw new Error('role is defined by a subclass'); }
+  get roleLabel() { return this.role.charAt(0).toUpperCase() + this.role.slice(1); }
+  landing() { throw new Error('landing is defined by a subclass'); }
+  canManageClass() { return false; }
+  details() { return ''; }
+  tourSteps() { throw new Error('tourSteps is defined by a subclass'); }
+  static create(data) { return data.role === 'teacher' ? new Teacher(data) : new Student(data); }
+}
+class Student extends Person {
+  constructor(data) {
+    super(data);
+    this.age = data.age || ''; this.year = data.year || ''; this.section = data.section || ''; this.address = data.address || '';
+  }
+  get role() { return 'student'; }
+  landing() { return this.id; }
+  details() { return [this.year, this.section].filter(Boolean).join(' · '); }
+  tourSteps() {
+    return [
+      { page: 'home', target: '#nav [data-page="home"]', title: 'Welcome to Keenly', body: 'This is your home page. It shows your overall grade, your open tasks and what is due next. The strip under the summary counts what is due in the next 7 days.' },
+      { page: 'grades', target: '#nav [data-page="grades"]', title: 'Your grades', body: 'Your teacher enters your scores. Tap a subject to see every activity, the average for quizzes, activities, projects and exams, and your overall grade. Use the target box to see what you still need.' },
+      { page: 'tasks', target: '#nav [data-page="tasks"]', title: 'Tasks and due dates', body: 'Your own tasks and the assignments your teacher posts are in one list. Add a task with a due date, tick it when it is done, and keep an eye on the Late count.' },
+      { page: 'profile', target: '#nav [data-page="profile"]', title: 'Your profile', body: 'Keep your name, age, year and section, and address up to date here.' },
+      { page: 'home', target: '#tourBtn', title: 'You are all set', body: 'Tap Tour any time to see this again. Log out when you are done.' }];
+  }
+}
+class Teacher extends Person {
+  get role() { return 'teacher'; }
+  landing() { return null; }
+  canManageClass() { return true; }
+  details() { return 'Teacher'; }
+  tourSteps() {
+    return [
+      { page: 'home', target: '#nav [data-page="home"]', title: 'Welcome, teacher', body: 'Home shows how many students you have, the assignments you posted, and any late tasks across the class.' },
+      { page: 'class', target: '#nav [data-page="class"]', title: 'Your class list', body: 'Students appear here after they create their account. You can see each student\'s overall grade, open tasks and late tasks.' },
+      { page: 'class', target: '#addAssign', title: 'Post assignments', body: 'Post an assignment with a due date. It shows up in every student\'s task list.' },
+      { page: 'class', target: '#teacherBox [data-view]', title: 'Edit grades', body: 'Press Open next to a student to add subjects and scores or edit their grades. Use Back to class to return. Reset PIN lets a student create a new PIN if they forget it.' },
+      { page: 'home', target: '#tourBtn', title: 'You are all set', body: 'Tap Tour any time to see this again.' }];
+  }
+}
+
+/** A person using Keenly on their own device, without a classroom. */
+class LocalUser extends Person {
+  get role() { return 'user'; }
+  get roleLabel() { return 'Personal'; }
+  landing() { return null; }
+  tourSteps() {
+    return [
+      { page: 'home', target: '#nav [data-page="home"]', title: 'Welcome to Keenly', body: 'Home shows your overall grade, your open tasks and what is due next. Your account and data stay on this device.' },
+      { page: 'grades', target: '#subjectForm', title: 'Add a subject', body: 'Start on Grades. Add a subject, then set the weights for quizzes, activities, projects and exams (aim for 100) and add your scores.' },
+      { page: 'grades', target: '#gradesTitle', title: 'Your grade updates as you go', body: 'Each subject shows its percentage and grade equivalent. Set a target to see what you still need on the parts that are not scored yet.' },
+      { page: 'tasks', target: '#taskForm', title: 'Add tasks', body: 'Add a task with a due date and priority. Tick it when it is done. Late tasks turn orange and are counted on Home.' },
+      { page: 'home', target: '#tourBtn', title: 'You are all set', body: 'Tap Tour any time to see this again. Use the same browser each time, since your data is saved on this device.' }];
+  }
+}
+
+/* ---------- storage: two stores with one contract ---------- */
+
+class LocalStore {
+  #key;
+  constructor(key) { this.#key = key; }
+  get busy() { return false; }
+  load() {
+    try {
+      const s = localStorage.getItem(this.#key);
+      if (s) { const o = JSON.parse(s); if (o && o.subjects && o.tasks) return GradeBook.fromJSON(o); }
+    } catch (e) { /* storage unavailable */ }
+    return GradeBook.empty();
+  }
+  save(book) { try { localStorage.setItem(this.#key, JSON.stringify(book)); } catch (e) { /* ignore */ } }
+}
+
+/** Accounts for using Keenly on one device. Names and hashed PINs are kept in this browser only. */
+class LocalAuth {
+  #key = 'keenly.accounts';
+  #read() { try { return JSON.parse(localStorage.getItem(this.#key)) || []; } catch (e) { return []; } }
+  count() { return this.#read().length; }
+  person(id) { const a = this.#read().find((x) => x.id === id); return a ? new LocalUser({ id: a.id, name: a.name }) : null; }
+  async create(name, pin) {
+    const list = this.#read(), q = name.trim().toLowerCase();
+    if (list.some((a) => a.nameLower === q)) throw new Error('exists');
+    const id = uid();
+    list.push({ id, name: name.trim(), nameLower: q, pinHash: await Hasher.pin(id, pin) });
+    try { localStorage.setItem(this.#key, JSON.stringify(list)); } catch (e) { throw new Error('storage'); }
+    return id;
+  }
+  /** Resolves with the account id, or rejects with Error('bad'). */
+  async verify(name, pin) {
+    const a = this.#read().find((x) => x.nameLower === name.trim().toLowerCase());
+    if (!a || (await Hasher.pin(a.id, pin)) !== a.pinHash) throw new Error('bad');
+    return a.id;
+  }
+}
+
+class RemoteStore {
+  #db; #path; #pick; #book = null; #timer = null; #writing = false; #dirty = false; #onError;
+  constructor(db, path, pick, onError) { this.#db = db; this.#path = path; this.#pick = pick; this.#onError = onError; }
+  get busy() { return this.#writing || this.#dirty; }
+  save(book) {
+    this.#book = book; this.#dirty = true;
+    clearTimeout(this.#timer);
+    this.#timer = setTimeout(() => this.#flush(), 400);
+  }
+  #flush() {
+    if (this.#writing) { this.#timer = setTimeout(() => this.#flush(), 300); return; }
+    if (!this.#dirty) return;
+    this.#dirty = false; this.#writing = true;
+    const body = clone(this.#pick(this.#book));
+    this.#db.doc(this.#path).set({ data: body, updated: Date.now() }).then(
+      () => { this.#writing = false; if (this.#dirty) this.#flush(); },
+      () => { this.#writing = false; this.#onError('Could not save to the classroom. Ask the owner for Contributor access.'); });
+  }
+}
+
+/** Saves one student's record as two documents so the teacher's grade edits and the student's own tasks never overwrite each other. */
+class ClassStore {
+  #grades; #todo;
+  constructor(db, id, onError) {
+    this.#grades = new RemoteStore(db, 'records/' + id, (b) => b.gradesJSON(), onError);
+    this.#todo = new RemoteStore(db, 'todo/' + id, (b) => b.todoJSON(), onError);
+  }
+  get busy() { return this.#grades.busy || this.#todo.busy; }
+  save(book, part = 'all') {
+    if (part !== 'todo') this.#grades.save(book);
+    if (part !== 'grades') this.#todo.save(book);
+  }
+}
+
+/* ---------- classroom service: everything that talks to the shared database ---------- */
+
+class ClassroomService {
+  #db;
+  constructor(db) {
+    this.#db = db; this.classroom = null; this.members = {}; this.records = {}; this.todos = {}; this.assigns = {};
+    this.loaded = { classroom: false, members: false };
+  }
+  get db() { return this.#db; }
+
+  start(onChange, onFail) {
+    const watch = (path, kind, apply) => this.#db.collection(path).onSnapshot((snap) => {
+      apply(snap); if (kind in this.loaded) this.loaded[kind] = true; onChange(kind);
+    }, onFail);
+    const copy = (target) => (s) => { this[target] = {}; s.docs.forEach((d) => { this[target][d.id] = Object.assign({}, d.data()); }); };
+    watch('classroom', 'classroom', (s) => { this.classroom = null; s.docs.forEach((d) => { if (d.id === 'main') this.classroom = Object.assign({}, d.data()); }); });
+    watch('members', 'members', copy('members'));
+    watch('assignments', 'assignments', copy('assigns'));
+    watch('records', 'records', copy('records'));
+    watch('todo', 'todo', copy('todos'));
+  }
+  studentIds() {
+    return Object.keys(this.members).filter((id) => this.members[id].role !== 'teacher')
+      .sort((a, b) => String(this.members[a].name).localeCompare(String(this.members[b].name)));
+  }
+  assignments() { return Object.keys(this.assigns).map((id) => Object.assign({ id }, this.assigns[id])); }
+  recordFor(id) {
+    const g = this.records[id], t = this.todos[id];
+    return GradeBook.fromParts(g ? clone(g.data) : null, t ? clone(t.data) : null);
+  }
+  person(id) { const m = this.members[id]; return m ? Person.create(Object.assign({}, m, { id })) : null; }
+
+  async createClassroom(className, teacherName, pin) {
+    const g = await this.#db.doc('classroom/main').get();
+    if (g.exists) throw new Error('exists');
+    const id = uid();
+    const rec = { name: teacherName, nameLower: teacherName.toLowerCase(), role: 'teacher', pinHash: await Hasher.pin(id, pin), createdAt: Date.now() };
+    await this.#db.doc('members/' + id).set(rec);
+    await this.#db.doc('classroom/main').set({ name: className, teacherId: id, teacherName, created: Date.now() });
+    this.members[id] = rec; this.classroom = { name: className, teacherId: id, teacherName };
+    return id;
+  }
+  /** Resolves with the teacher's id, or rejects with Error('bad'). */
+  async verifyTeacher(pin) {
+    const c = this.classroom, m = c && this.members[c.teacherId];
+    if (!m || (await Hasher.pin(c.teacherId, pin)) !== m.pinHash) throw new Error('bad');
+    return c.teacherId;
+  }
+  async #findStudent(name, number) {
+    const q = name.trim().toLowerCase();
+    for (const id of Object.keys(this.members)) {
+      const m = this.members[id];
+      if (m.role === 'teacher' || m.nameLower !== q) continue;
+      if ((await Hasher.num(id, number)) === m.numHash) return id;
+    }
+    return null;
+  }
+  async registerStudent(f) {
+    if (await this.#findStudent(f.name, f.number)) throw new Error('exists');
+    const id = uid();
+    const rec = { name: f.name, nameLower: f.name.toLowerCase(), role: 'student', numHash: await Hasher.num(id, f.number), pinHash: await Hasher.pin(id, f.pin),
+      age: f.age, year: f.year, section: f.section, address: f.address, createdAt: Date.now() };
+    await this.#db.doc('members/' + id).set(rec);
+    this.members[id] = rec;
+    return id;
+  }
+  /** Resolves with the student's id, or rejects with Error('bad'). A student whose PIN was reset creates a new one here. */
+  async verifyStudent(name, number, pin) {
+    const id = await this.#findStudent(name, number);
+    if (!id) throw new Error('bad');
+    const m = this.members[id], ph = await Hasher.pin(id, pin);
+    if (!m.pinHash) { await this.#db.doc('members/' + id).update({ pinHash: ph }); m.pinHash = ph; }
+    else if (ph !== m.pinHash) throw new Error('bad');
+    return id;
+  }
+  resetPin(id) { return this.#db.doc('members/' + id).update({ pinHash: '' }); }
+  updateProfile(id, f) { return this.#db.doc('members/' + id).update(Object.assign({ nameLower: f.name.toLowerCase() }, f)); }
+  postAssignment(a) { return this.#db.collection('assignments').add(Object.assign({ createdAt: Date.now() }, a)); }
+  removeAssignment(id) { return this.#db.doc('assignments/' + id).delete(); }
+}
+
+/* ---------- first-time tutorial ---------- */
+
+class Tour {
+  #steps = []; #i = 0; #id = ''; #hl = null; #onGo;
+  constructor(onGo) { this.#onGo = onGo; }
+  static seen(id) { try { return localStorage.getItem('keenly.tour.' + id) === '1'; } catch (e) { return false; } }
+  static mark(id) { try { localStorage.setItem('keenly.tour.' + id, '1'); } catch (e) { /* ignore */ } }
+  get isOpen() { return !$('tour').hidden; }
+  open(steps, id) { this.#steps = steps; this.#i = 0; this.#id = id; $('tour').hidden = false; this.#render(); $('tourNext').focus(); }
+  next() { if (this.#i >= this.#steps.length - 1) this.close(); else { this.#i++; this.#render(); } }
+  back() { if (this.#i > 0) { this.#i--; this.#render(); } }
+  close() {
+    this.#clear();
+    if (this.#id) Tour.mark(this.#id);
+    $('tour').hidden = true;
+  }
+  #clear() { if (this.#hl) { this.#hl.classList.remove('tour-hl'); this.#hl = null; } }
+  #render() {
+    const s = this.#steps[this.#i], last = this.#i === this.#steps.length - 1;
+    this.#clear();
+    this.#onGo(s.page);
+    $('tourStep').textContent = `Step ${this.#i + 1} of ${this.#steps.length}`;
+    $('tourTitle').textContent = s.title;
+    $('tourBody').textContent = s.body;
+    $('tourDots').innerHTML = this.#steps.map((_, n) => `<span class="dot${n === this.#i ? ' on' : ''}"></span>`).join('');
+    $('tourBack').disabled = this.#i === 0;
+    $('tourNext').textContent = last ? 'Done' : 'Next';
+    $('tourSkip').hidden = last;
+    const el = s.target ? document.querySelector(s.target) : null;
+    if (el && !el.closest('[hidden]')) {
+      el.classList.add('tour-hl'); this.#hl = el;
+      const calm = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+      try { el.scrollIntoView({ block: 'center', behavior: calm ? 'auto' : 'smooth' }); } catch (e) { /* ignore */ }
+    }
+  }
+}
+
+/* ---------- the app (view + controller) ---------- */
+
+class App {
+  static ME = 'keenly.me';
+  static LME = 'keenly.lme';
+
+  constructor() {
+    this.local = new LocalStore('keenly.none'); // never saved to: the real store is chosen at log in
+    this.auth = new LocalAuth(); this.tour = new Tour((page) => this.navigate(page));
+    this.svc = null; this.me = null; this.canWrite = true;
+    this.book = this.local.load(); this.store = this.local;
+    this.viewId = null; this.filter = 'open';
+    this.ROG = false; // grades are read-only (students)
+    this.ROT = false; // tasks are read-only (no write access)
+    this.active = this.book.subjects.length ? this.book.subjects[0].id : null;
+    this.page = 'home'; this.booted = false; this.justJoined = false;
+    this.loginRole = null; this.studentMode = 'login'; this.localMode = this.auth.count() ? 'login' : 'signup'; this.loginErr = ''; this.loginKey = '';
+    this.fails = 0; this.lockUntil = 0;
+  }
+
+  /* --- helpers --- */
+  get subject() { return this.book.subject(this.active); }
+  currentTasks() { return this.book.tasksWith(this.viewId && this.svc ? this.svc.assignments() : []); }
+  msg(t) { $('clsNote').textContent = t || (!this.booted ? 'Loading the classroom...' : this.svc ? '' : 'The classroom is not available here, so your data stays on this device.'); }
+  get loggedIn() { return !!this.me; }
+  get isRoster() { return !!this.me && this.me.canManageClass() && !this.viewId; }
+  commit(part) { this.store.save(this.book, part); this.renderAll(); }
+
+  /* --- rendering: summary --- */
+  renderStats() {
+    const labels = (a, b, c) => { $('stL1').textContent = a; $('stL2').textContent = b; $('stL3').textContent = c; };
+    if (this.isRoster) {
+      const ids = this.svc.studentIds(), asg = this.svc.assignments();
+      let late = 0;
+      ids.forEach((id) => { late += this.svc.recordFor(id).tasks.filter((t) => t.isLate).length; });
+      labels('Students', 'Assignments', 'Late tasks');
+      $('stGwa').textContent = ids.length; $('stGwaNote').textContent = 'in your class';
+      $('stOpen').textContent = asg.length; $('stOpenNote').textContent = 'posted for everyone';
+      $('stNext').textContent = late; $('stNextNote').textContent = late ? 'across all students' : 'all caught up';
+      return;
+    }
+    labels('Overall grade', 'Open tasks', 'Next due');
+    const g = this.book.gwa();
+    $('stGwa').textContent = g.value == null ? '–' : g.value.toFixed(2);
+    $('stGwaNote').textContent = g.value == null ? 'no scores yet' : `GWA across ${g.units} units`;
+    const open = this.currentTasks().filter((t) => !t.done);
+    $('stOpen').textContent = open.length;
+    const late = open.filter((t) => t.isLate).length;
+    $('stOpenNote').textContent = late ? `${late} overdue` : 'none overdue';
+    open.sort((a, b) => (a.due < b.due ? -1 : 1));
+    if (open.length) {
+      const n = open[0], d = n.daysLeft;
+      $('stNext').textContent = d < 0 ? 'Late' : d === 0 ? 'Today' : d === 1 ? 'Tomorrow' : Dates.short(n.due);
+      $('stNextNote').textContent = n.title;
+    } else { $('stNext').textContent = '–'; $('stNextNote').textContent = 'nothing waiting'; }
+  }
+
+  /* --- rendering: home --- */
+  renderHome() {
+    const hr = new Date().getHours(), greet = hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
+    let name = 'there';
+    if (this.me) name = this.me.canManageClass() ? this.me.name : this.me.name.split(/\s+/)[0];
+    $('helloTitle').textContent = this.justJoined ? `Welcome, ${name}!` : `${greet}, ${name}`;
+    const roster = this.isRoster;
+    $('quickForm').hidden = roster || this.ROT; $('weekStrip').hidden = roster; if (roster) $('startCard').hidden = true;
+    const day = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+    const cls = this.svc && this.svc.classroom ? ' · ' + this.svc.classroom.name : '';
+    const viewing = this.me && this.me.canManageClass() && this.viewId && this.svc.members[this.viewId] ? ` · viewing ${this.svc.members[this.viewId].name}` : '';
+    const mine = this.me && !this.me.canManageClass() && this.me.details() ? ' · ' + this.me.details() : '';
+    $('helloSub').textContent = this.justJoined ? 'Your account is ready. Here is your home page.' : day + cls + mine + viewing;
+    const none = (t) => `<li><span class="sub">${t}</span></li>`;
+    if (roster) {
+      $('homeMainTitle').textContent = 'Posted assignments';
+      const al = this.svc.assignments().sort((a, b) => (a.due < b.due ? -1 : 1)).slice(0, 5);
+      $('homeMain').innerHTML = al.length ? al.map((a) => {
+        const d = Dates.daysTo(a.due);
+        return `<li><div><b>${esc(a.title)}</b><div class="sub">${a.subject ? esc(a.subject) + ' · ' : ''}${d < 0 ? 'Past due' : d === 0 ? 'Due today' : 'Due ' + Dates.short(a.due)}</div></div></li>`;
+      }).join('') : none('Nothing posted yet.');
+      $('homeMainBtn').textContent = 'Manage class'; $('homeMainBtn').dataset.go = 'class';
+      $('homeSideTitle').textContent = 'Needs attention';
+      const rows = [];
+      this.svc.studentIds().forEach((id) => {
+        const late = this.svc.recordFor(id).tasks.filter((t) => t.isLate).length;
+        if (late) rows.push(`<li><span><b>${esc(this.svc.members[id].name)}</b></span><span class="v late">${late} late</span></li>`);
+      });
+      $('homeSide').innerHTML = rows.length ? rows.join('') : none('No late tasks right now.');
+      $('homeSideBtn').textContent = 'Open class list'; $('homeSideBtn').dataset.go = 'class';
+      return;
+    }
+    $('homeMainTitle').textContent = 'Coming up';
+    const open = this.currentTasks().filter((t) => !t.done).sort((a, b) => (a.due < b.due ? -1 : 1)).slice(0, 5);
+    $('homeMain').innerHTML = open.length ? open.map((t) => {
+      const ctx = t.contextLabel(this.book);
+      return `<li><div><b>${esc(t.title)}</b><div class="sub">${ctx ? esc(ctx) : ''}${t.badges().some((b) => b.text === 'Class') ? ' · Class' : ''}</div></div><span class="v${t.isLate ? ' late' : ''}">${t.whenLabel()}</span></li>`;
+    }).join('') : none('Nothing waiting. Enjoy the break.');
+    $('homeMainBtn').textContent = 'See all tasks'; $('homeMainBtn').dataset.go = 'tasks';
+    $('homeSideTitle').textContent = 'Your subjects';
+    $('homeSide').innerHTML = this.book.subjects.length ? this.book.subjects.map((s) => {
+      const p = s.percent;
+      const st = p == null ? '' : `<span class="pill ${p >= 75 ? 'cls' : 'high'}">${p >= 75 ? 'On track' : 'At risk'}</span> `;
+      return `<li><button type="button" class="go" data-homesub="${s.id}"><b>${esc(s.name)}</b><span class="v">${st}${p == null ? 'no scores' : p.toFixed(1) + '% · ' + s.equivalent}</span></button></li>`;
+    }).join('') : none(this.ROG ? 'Your teacher has not added any grades yet.' : 'No subjects yet.');
+    $('homeSideBtn').textContent = 'Open grades'; $('homeSideBtn').dataset.go = 'grades';
+    this.renderWeek(); this.renderStart();
+  }
+  renderWeek() {
+    const open = this.currentTasks().filter((t) => !t.done);
+    const late = open.filter((t) => t.isLate).length;
+    let h = late ? `<button type="button" class="day latec" data-go="tasks" aria-label="${late} late"><small>Late</small><b>${late}</b><span>tasks</span></button>` : '';
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(); d.setDate(d.getDate() + i);
+      const n = open.filter((t) => t.due === Dates.iso(d)).length, label = i === 0 ? 'Today' : d.toLocaleDateString(undefined, { weekday: 'short' });
+      h += `<button type="button" class="day${i === 0 ? ' today' : ''}" data-go="tasks" aria-label="${label} ${d.getDate()}: ${n} due"><small>${label}</small><b>${n || '·'}</b><span>${d.getDate()}</span></button>`;
+    }
+    $('weekStrip').innerHTML = h;
+  }
+  renderStart() {
+    const b = this.book;
+    const steps = [
+      { t: 'Add your first subject', done: b.subjects.length > 0, go: 'grades' },
+      { t: 'Enter a score to see your grade', done: b.subjects.some((x) => x.items.length > 0), go: 'grades' },
+      { t: 'Add a task or two', done: b.tasks.length > 0 || b.example, go: 'tasks' }];
+    const all = steps.every((x) => x.done);
+    $('startCard').hidden = all || b.example || this.ROG;
+    $('startList').innerHTML = steps.map((x) => `<li><button type="button" class="go" data-go="${x.go}"><span class="step${x.done ? ' done' : ''}"><span class="tick${x.done ? ' on' : ''}" aria-hidden="true">${x.done ? '✓' : ''}</span><b>${x.t}</b></span><span class="sub">${x.done ? 'Done' : 'Go'}</span></button></li>`).join('');
+  }
+  navigate(page) { this.page = page; if (page !== 'home') this.justJoined = false; if (page === 'profile') this.fillProfile(); this.renderShell(); }
+
+  /* --- rendering: shell (login screen or the app with its pages) --- */
+  renderShell() {
+    const logged = this.loggedIn;
+    $('loginView').hidden = logged; $('appView').hidden = !logged; $('nav').hidden = !logged; $('userChip').hidden = !logged;
+    if (!logged) return;
+    const student = !!this.me && this.me.role === 'student';
+    const allowed = this.isRoster ? ['home', 'class'] : student ? ['home', 'grades', 'tasks', 'profile'] : ['home', 'grades', 'tasks'];
+    if (allowed.indexOf(this.page) < 0) this.page = allowed[0];
+    document.querySelectorAll('#nav [data-page]').forEach((b) => {
+      b.hidden = allowed.indexOf(b.dataset.page) < 0;
+      if (b.dataset.page === this.page) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    });
+    $('homeView').hidden = this.page !== 'home';
+    $('classView').hidden = this.page !== 'class';
+    $('gradesPanel').hidden = this.page !== 'grades';
+    $('tasksPanel').hidden = this.page !== 'tasks';
+    $('profilePanel').hidden = this.page !== 'profile';
+    $('gradesTitle').textContent = this.ROG ? 'My grades' : 'Grade calculator';
+    $('userLabel').textContent = this.me ? `${this.me.name} · ${this.me.roleLabel}` : 'This device only';
+    const bar = $('meBar'), editing = !!this.me && this.me.canManageClass() && !!this.viewId;
+    bar.hidden = !editing;
+    if (editing) {
+      const st = this.svc.members[this.viewId];
+      bar.innerHTML = `<span>Editing <b>${esc(st ? st.name : 'student')}</b></span><button class="btn" type="button" data-act="back">Back to class</button>`;
+    }
+  }
+
+  /* --- rendering: grades --- */
+  renderSubjects() {
+    $('subjectForm').hidden = this.ROG;
+    const h = this.book.subjects.map((s) => {
+      const p = s.percent;
+      return `<button type="button" class="chip" data-sub="${s.id}"${s.id === this.active ? ' aria-current="true"' : ''}><b>${esc(s.name)}</b><span>${p == null ? 'no scores yet' : p.toFixed(1) + '% · ' + s.equivalent}</span></button>`;
+    }).join('');
+    $('subjectList').innerHTML = h || `<p class="empty" style="flex:1">${this.ROG ? 'Your teacher has not added any grades yet. They will show up here.' : 'No subjects yet. Add one below.'}</p>`;
+    const sel = $('tSubject'), keep = sel.value;
+    sel.innerHTML = '<option value="">No subject</option>' + this.book.subjects.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+    sel.value = keep;
+  }
+  renderDetail() {
+    const s = this.subject, box = $('detail'), ro = this.ROG;
+    if (!s) { box.innerHTML = ''; return; }
+    const p = s.percent, wt = s.weightTotal;
+    let h = `<div class="detail"><div class="row" style="justify-content:space-between;align-items:center"><h3>${esc(s.name)} <span class="sub">${s.units} units</span></h3>${ro ? '' : '<button class="btn ghost" type="button" data-act="delSub">Remove subject</button>'}</div>`;
+    h += `<div class="big"><b>${p == null ? '–' : p.toFixed(1) + '%'}</b><span class="eq">${s.equivalent}</span>${p == null ? '' : `<span class="pill ${p >= 75 ? 'cls' : 'high'}">${p >= 75 ? 'Passing' : 'Below 75'}</span>`}<span class="sub">overall grade so far</span></div>`;
+    h += '<div><p class="sub" style="margin-bottom:6px">By activity type (average and weight)</p><div class="cats">' + s.categoryAverages().map((c) => `<div class="catc"><small>${c.cat} · ${c.weight}%</small><b>${c.avg == null ? '–' : c.avg.toFixed(1) + '%'}</b></div>`).join('') + '</div></div>';
+    if (!ro) {
+      h += `<div><p class="sub" style="margin-bottom:6px">Weights (%)${wt !== 100 ? ` · now ${wt}, aim for 100` : ''}</p><div class="weights">`;
+      CATS.forEach((c) => { h += `<label>${c}<input type="number" min="0" max="100" data-w="${c}" id="w${c}" value="${+s.weights[c] || 0}"></label>`; });
+      h += '</div></div>';
+    }
+    h += `<div class="scroll"><table><thead><tr><th>Activity</th><th>Type</th><th>Score</th><th>%</th>${ro ? '' : '<th></th>'}</tr></thead><tbody>`;
+    const items = s.items;
+    if (!items.length) h += `<tr><td colspan="5" class="sub">No scores yet.</td></tr>`;
+    items.forEach((i) => {
+      h += `<tr><td>${esc(i.name)}</td><td>${i.cat}</td><td class="n">${i.score} / ${i.total}</td><td class="n">${i.percent == null ? '–' : i.percent.toFixed(1)}</td>${ro ? '' : `<td><button class="btn ghost" type="button" data-del="${i.id}" aria-label="Remove ${esc(i.name)}">Remove</button></td>`}</tr>`;
+    });
+    h += '</tbody></table></div>';
+    if (!ro) {
+      h += `<form class="row" id="itemForm"><label class="f" style="flex:2 1 130px">Activity<input id="iName" required maxlength="40" placeholder="Quiz 3"></label>
+        <label class="f">Type<select id="iCat">${CATS.map((c) => `<option>${c}</option>`).join('')}</select></label>
+        <label class="f" style="flex:0 1 80px">Score<input id="iScore" type="number" step="any" min="0" required></label>
+        <label class="f" style="flex:0 1 80px">Out of<input id="iTotal" type="number" step="any" min="1" required></label>
+        <button class="btn pri" type="submit">Add score</button></form>`;
+    }
+    h += `<div class="plan"><label class="f" style="flex-direction:row;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:14px;color:var(--fg)">I want a final grade of <input id="target" type="number" min="1" max="100" value="${s.target || 85}" style="width:84px">%</label><p id="planOut"></p></div></div>`;
+    box.innerHTML = h;
+    this.renderPlan();
+  }
+  renderPlan() {
+    const out = $('planOut'), s = this.subject;
+    if (!out || !s) return;
+    const t = +$('target').value || 0, r = s.needed(t);
+    const names = r.names ? esc(r.names.join(', ')) : '';
+    if (r.state === 'noweights') out.textContent = 'Weights are not set yet.';
+    else if (r.state === 'complete') out.innerHTML = `Every category has scores. Final so far: <span class="need">${r.final.toFixed(1)}%</span> (${Subject.equivalent(r.final)})${r.met ? '. Target met.' : '.'}`;
+    else if (r.state === 'reached') out.innerHTML = `Already enough to reach ${t}%, even with zeros in ${names}.`;
+    else if (r.state === 'impossible') out.innerHTML = `Reaching ${t}% would need <span class="need" style="color:var(--warn)">${r.need.toFixed(1)}%</span> on ${names}. That is out of reach, so consider a lower target.`;
+    else out.innerHTML = `Average <span class="need">${r.need.toFixed(1)}%</span> on ${names} to finish at ${t}%.`;
+  }
+
+  /* --- rendering: tasks (polymorphic calls on Task and ClassTask) --- */
+  renderTasks() {
+    const list = this.currentTasks().filter((t) => this.filter === 'all' || (this.filter === 'open' ? !t.done : t.done));
+    list.sort((a, b) => (a.due < b.due ? -1 : a.due > b.due ? 1 : 0));
+    const h = list.map((t) => {
+      const ctx = t.contextLabel(this.book);
+      const badges = t.badges().map((b) => `<span class="pill ${b.cls}">${esc(b.text)}</span>`).join('');
+      return `<li class="task${t.done ? ' done' : ''}"><input type="checkbox" data-tog="${esc(t.id)}"${t.done ? ' checked' : ''} aria-label="Mark ${esc(t.title)} done">
+        <div class="t"><b>${esc(t.title)}</b><div class="meta"><span${t.isLate ? ' class="late"' : ''}>${t.whenLabel()}</span>${ctx ? `<span>${esc(ctx)}</span>` : ''}${badges}</div></div>
+        ${t.canDelete() ? `<button class="btn ghost" type="button" data-rm="${t.id}" aria-label="Delete ${esc(t.title)}">Delete</button>` : ''}</li>`;
+    }).join('');
+    $('taskList').innerHTML = h || `<li><p class="empty">${this.filter === 'done' ? 'Nothing finished yet.' : 'No tasks here.' + (this.ROT ? '' : ' Add one above.')}</p></li>`;
+  }
+  applyRO() {
+    if (!this.ROT) return;
+    const sel = '#taskForm input,#taskForm select,#taskForm button,#quickForm input,#quickForm button,#taskList input,#taskList button';
+    document.querySelectorAll(sel).forEach((el) => { el.disabled = true; });
+  }
+  renderAll() { this.renderStats(); this.renderSubjects(); this.renderDetail(); this.renderTasks(); this.renderHome(); this.renderShell(); this.applyRO(); }
+
+  /* --- rendering: login --- */
+  renderLoginBody(force) {
+    const box = $('loginBody'), svc = this.svc;
+    const key = [this.booted, !!svc, svc && svc.classroom ? 1 : 0, svc && svc.loaded.members, svc && svc.loaded.classroom, this.loginRole, this.studentMode, this.localMode, this.loginErr].join('|');
+    if (!force && key === this.loginKey) return;
+    this.loginKey = key;
+    const pin = (id, label) => `<label class="f">${label}<input id="${id}" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required autocomplete="off"></label>`;
+    let h = '';
+    if (!this.booted) h = '<p class="sub">Loading...</p>';
+    else if (!svc) h = this.localForms(pin);
+    else if (!svc.loaded.members || !svc.loaded.classroom) h = '<p class="sub">Loading the classroom...</p>';
+    else {
+      const r = this.loginRole, c = svc.classroom;
+      h = `<p class="sub" style="margin-bottom:8px">I am a</p><div class="rolepick">
+        <button type="button" class="rolebtn" data-role="teacher" aria-pressed="${r === 'teacher'}"><b>Teacher</b><span>Run the class and edit grades</span></button>
+        <button type="button" class="rolebtn" data-role="student" aria-pressed="${r === 'student'}"><b>Student</b><span>See my grades, tasks and due dates</span></button></div>`;
+      if (r === 'teacher') {
+        h += c
+          ? `<form id="tLoginForm" class="row form" autocomplete="off"><p class="sub" style="flex:1 1 100%">Teacher log in for <b>${esc(c.name)}</b></p>${pin('tPin', 'Your 4-digit PIN')}<button class="btn pri" type="submit">Log in</button></form>`
+          : `<form id="createForm" class="row form" autocomplete="off"><p class="sub" style="flex:1 1 100%">No classroom yet. Create it and you become its admin.</p>
+              <label class="f" style="flex:1 1 100%">Classroom name<input id="cName" required maxlength="50" placeholder="e.g. BSIT 2-B"></label>
+              <label class="f" style="flex:1 1 100%">Your name<input id="cTeacher" required maxlength="60" placeholder="e.g. Mr. Santos"></label>
+              ${pin('cPin', 'Create a 4-digit PIN')}<button class="btn pri" type="submit">Create classroom</button></form>`;
+      } else if (r === 'student') {
+        if (!c) h += '<p class="sub form">Your teacher has not created the classroom yet. Please come back soon.</p>';
+        else if (this.studentMode === 'login') {
+          h += `<form id="sLoginForm" class="row form" autocomplete="off">
+            <label class="f" style="flex:1 1 100%">Your name<input id="sName" required maxlength="60"></label>
+            ${pin('sPin', '4-digit PIN')}<label class="f">Student number<input id="sNum" type="text" inputmode="numeric" required maxlength="20" autocomplete="off"></label>
+            <button class="btn pri" type="submit">Log in</button></form>
+            <p class="sub" style="margin-top:10px">New here? <button type="button" class="link" id="modeToggle">Create my account</button></p>`;
+        } else {
+          h += `<form id="sSignupForm" class="row form" autocomplete="off"><p class="sub" style="flex:1 1 100%">Tell us about yourself. Remember your PIN and student number to log in next time.</p>
+            <label class="f" style="flex:1 1 100%">Full name<input id="uName" required maxlength="60"></label>
+            <label class="f">Student number<input id="uNum" type="text" inputmode="numeric" required maxlength="20" autocomplete="off"></label>
+            ${pin('uPin', 'Create a 4-digit PIN')}
+            <label class="f" style="flex:0 1 90px">Age<input id="uAge" type="number" min="5" max="99" required></label>
+            <label class="f">Year<input id="uYear" required maxlength="30" placeholder="e.g. 2nd Year"></label>
+            <label class="f">Section<input id="uSection" required maxlength="30" placeholder="e.g. BSIT 2-B"></label>
+            <label class="f" style="flex:1 1 100%">Address<input id="uAddr" required maxlength="140" placeholder="House no., street, barangay, town"></label>
+            <button class="btn pri" type="submit">Create my account</button></form>
+            <p class="sub" style="margin-top:10px">Already have an account? <button type="button" class="link" id="modeToggle">Log in</button></p>`;
+        }
+      }
+    }
+    if (this.loginErr && h) h += `<p class="late" style="margin:10px 0 0">${esc(this.loginErr)}</p>`;
+    box.innerHTML = h;
+  }
+  localForms(pin) {
+    if (this.localMode === 'login') {
+      return `<form id="lLoginForm" class="row form" autocomplete="off">
+        <label class="f" style="flex:1 1 100%">Your name<input id="lName" required maxlength="60"></label>
+        ${pin('lPin', '4-digit PIN')}<button class="btn pri" type="submit">Log in</button></form>
+        <p class="sub" style="margin-top:10px">New here? <button type="button" class="link" id="lmodeToggle">Create an account</button></p>`;
+    }
+    return `<form id="lSignupForm" class="row form" autocomplete="off"><p class="sub" style="flex:1 1 100%">Your account and data stay on this device. Remember your PIN, since it cannot be recovered.</p>
+      <label class="f" style="flex:1 1 100%">Your name<input id="gName" required maxlength="60"></label>
+      ${pin('gPin', 'Create a 4-digit PIN')}<button class="btn pri" type="submit">Create account</button></form>
+      ${this.auth.count() ? '<p class="sub" style="margin-top:10px">Already have an account? <button type="button" class="link" id="lmodeToggle">Log in</button></p>' : ''}`;
+  }
+  renderClass() {
+    this.msg('');
+    const c = this.svc && this.svc.classroom;
+    $('clsTitle').textContent = c && c.name ? 'Welcome to ' + c.name : 'Welcome to Keenly';
+    const local = this.booted && !this.svc;
+    $('ltSign').textContent = c && c.teacherName ? c.teacherName : local ? 'Keenly' : 'Your teacher';
+    $('ltHow').textContent = local
+      ? 'Create an account with your name and a 4-digit PIN, then log in. Everything you enter stays on this device, so use the same browser each time.'
+      : 'Choose Teacher or Student to log in. Students create an account once with their name, student number, a 4-digit PIN, age, year and section, and address. After that, you only need your name, PIN and student number.';
+    $('ltDate').textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    this.renderTeacher(); this.renderLoginBody(); this.renderShell();
+  }
+  fillProfile() {
+    const m = this.svc && this.me && this.svc.members[this.me.id]; if (!m) return;
+    $('pfName').value = m.name || ''; $('pfAge').value = m.age || ''; $('pfYear').value = m.year || '';
+    $('pfSection').value = m.section || ''; $('pfAddr').value = m.address || '';
+    $('pfNote').textContent = '';
+  }
+  renderTeacher() {
+    const box = $('teacherBox'), svc = this.svc;
+    if (!(svc && this.me && this.me.canManageClass() && !this.viewId)) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    const ids = svc.studentIds();
+    let h = '<div class="tbox"><div class="stack"><h3>Class list</h3>';
+    if (!ids.length) h += '<p class="empty">No students yet. They appear here after they create their account.</p>';
+    else {
+      h += '<div class="scroll"><table><thead><tr><th>Student</th><th>Overall</th><th>Open</th><th>Late</th><th></th></tr></thead><tbody>';
+      ids.forEach((id) => {
+        const m = svc.members[id], book = svc.recordFor(id);
+        const g = book.gwa().value;
+        const open = book.tasks.filter((t) => !t.done), late = open.filter((t) => t.isLate).length;
+        const line = [m.age ? 'Age ' + m.age : '', m.year, m.section].filter(Boolean).map(esc).join(' · ');
+        h += `<tr><td><b>${esc(m.name)}</b>${line ? `<div class="sub">${line}</div>` : ''}${m.address ? `<div class="sub">${esc(m.address)}</div>` : ''}</td>
+          <td class="n">${g == null ? '–' : g.toFixed(2)}</td><td class="n">${open.length}</td><td class="n${late ? ' late' : ''}">${late}</td>
+          <td style="white-space:nowrap"><button class="btn" type="button" data-view="${id}">Open</button> <button class="btn ghost" type="button" data-reset="${id}"${m.pinHash ? '' : ' disabled'} title="Clear this student's PIN so they can create a new one">Reset PIN</button></td></tr>`;
+      });
+      h += '</tbody></table></div>';
+    }
+    h += '<p class="note">Open a student to add subjects and scores and to edit their grades. Students create their own account from the login page.</p></div>';
+    const al = svc.assignments().sort((a, b) => (a.due < b.due ? -1 : 1));
+    h += `<div class="stack"><h3>Class assignments</h3><form class="row" id="addAssign"><label class="f" style="flex:1 1 100%">Title<input id="aTitle" required maxlength="80" placeholder="e.g. Chapter 4 problems"></label>
+      <label class="f">Subject<input id="aSubj" maxlength="40" placeholder="optional"></label><label class="f">Due<input id="aDue" type="date" required value="${Dates.plus(7)}"></label><button class="btn pri" type="submit">Post</button></form>`;
+    h += al.length ? '<ul class="alist">' + al.map((a) => `<li><span><b>${esc(a.title)}</b><br><span class="sub">${Dates.short(a.due)}${a.subject ? ' · ' + esc(a.subject) : ''}</span></span><button class="btn ghost" type="button" data-dela="${a.id}">Delete</button></li>`).join('') + '</ul>'
+      : '<p class="empty">Nothing posted yet. Assignments show up in every student\'s task list.</p>';
+    h += '</div></div>';
+    box.innerHTML = h;
+  }
+
+  /* --- navigation between records --- */
+  setView(id, page) {
+    this.viewId = id && this.svc ? id : null;
+    if (this.viewId) {
+      this.book = this.svc.recordFor(this.viewId);
+      this.store = new ClassStore(this.svc.db, this.viewId, (t) => this.msg(t));
+    } else { this.book = this.local.load(); this.store = this.local; }
+    const student = !!this.me && this.me.role === 'student';
+    this.ROG = !!this.viewId && (student || !this.canWrite);
+    this.ROT = !!this.viewId && !this.canWrite;
+    this.active = this.book.subjects.length ? this.book.subjects[0].id : null;
+    if (page) this.page = page;
+    this.renderAll(); this.renderClass();
+  }
+  identify(id) {
+    const p = this.svc && this.svc.person(id); if (!p) return;
+    this.me = p; this.loginErr = ''; this.loginKey = ''; this.fails = 0;
+    try { sessionStorage.setItem(App.ME, id); } catch (e) { /* ignore */ }
+    this.setView(p.landing(), 'home');
+    this.maybeTour();
+  }
+  identifyLocal(id) {
+    const p = this.auth.person(id); if (!p) return;
+    this.me = p; this.loginErr = ''; this.loginKey = ''; this.fails = 0;
+    this.local = new LocalStore('keenly.u.' + id);
+    try { sessionStorage.setItem(App.LME, id); } catch (e) { /* ignore */ }
+    this.setView(null, 'home');
+    this.maybeTour();
+  }
+  maybeTour() { if (this.me && !Tour.seen(this.me.id)) setTimeout(() => { if (this.me) this.startTour(); }, 350); }
+  startTour() { if (this.me) this.tour.open(this.me.tourSteps(), this.me.id); }
+  leave() {
+    this.tour.close();
+    this.me = null; this.loginErr = ''; this.loginKey = ''; this.loginRole = null; this.studentMode = 'login';
+    this.localMode = this.auth.count() ? 'login' : 'signup'; this.local = new LocalStore('keenly.none');
+    try { sessionStorage.removeItem(App.ME); sessionStorage.removeItem(App.LME); } catch (e) { /* ignore */ }
+    this.setView(null, 'home');
+  }
+  failLogin() {
+    this.fails++;
+    if (this.fails >= 5) { this.lockUntil = Date.now() + 30000; this.fails = 0; this.loginErr = 'Too many tries. Wait 30 seconds.'; }
+    else this.loginErr = 'Those details do not match. Check your PIN, name and student number.';
+    this.renderLoginBody(true);
+  }
+  locked() { if (Date.now() < this.lockUntil) { this.loginErr = 'Too many tries. Wait a moment.'; this.renderLoginBody(true); return true; } return false; }
+
+  /* --- events --- */
+  wire() {
+    $('subjectList').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-sub]'); if (!b) return;
+      this.active = this.active === b.dataset.sub ? null : b.dataset.sub;
+      this.renderSubjects(); this.renderDetail(); this.applyRO();
+    });
+    $('subjectForm').addEventListener('submit', (e) => {
+      e.preventDefault(); if (this.ROG) return;
+      const name = $('subName').value.trim(); if (!name) return;
+      if (!this.viewId) this.book.clearExample();
+      this.active = this.book.addSubject(name, $('subUnits').value).id;
+      $('subName').value = ''; this.commit('grades');
+    });
+    $('detail').addEventListener('click', (e) => {
+      if (this.ROG) return;
+      const d = e.target.closest('[data-del]');
+      if (d) { this.subject.removeItem(d.dataset.del); this.commit('grades'); return; }
+      const a = e.target.closest('[data-act]');
+      if (a && a.dataset.act === 'delSub') { this.book.removeSubject(this.active); this.active = null; this.commit('all'); }
+    });
+    $('detail').addEventListener('change', (e) => {
+      if (this.ROG) return;
+      const w = e.target.dataset && e.target.dataset.w; if (!w) return;
+      this.subject.setWeight(w, e.target.value); this.commit('grades');
+    });
+    $('detail').addEventListener('input', (e) => {
+      if (e.target.id !== 'target' || !this.subject) return;
+      this.subject.target = +e.target.value || 0;
+      if (!this.ROG) this.store.save(this.book, 'grades');
+      this.renderPlan();
+    });
+    $('detail').addEventListener('submit', (e) => {
+      e.preventDefault(); if (this.ROG) return;
+      const score = +$('iScore').value, total = +$('iTotal').value;
+      if (!(total > 0) || score < 0) return;
+      this.subject.addItem({ cat: $('iCat').value, name: $('iName').value.trim(), score, total });
+      this.commit('grades');
+    });
+
+    $('taskForm').addEventListener('submit', (e) => {
+      e.preventDefault(); if (this.ROT) return;
+      const title = $('tTitle').value.trim(); if (!title) return;
+      this.book.addTask({ title, subjectId: $('tSubject').value, due: $('tDue').value, priority: $('tPri').value });
+      $('tTitle').value = ''; this.commit('todo');
+    });
+    $('quickForm').addEventListener('submit', (e) => {
+      e.preventDefault(); if (this.ROT) return;
+      const title = $('qTitle').value.trim(); if (!title) return;
+      this.book.addTask({ title, due: $('qDue').value });
+      $('qTitle').value = ''; this.commit('todo');
+    });
+    $('taskList').addEventListener('click', (e) => {
+      if (this.ROT) return;
+      const r = e.target.closest('[data-rm]'); if (r) { this.book.removeTask(r.dataset.rm); this.commit('todo'); }
+    });
+    $('taskList').addEventListener('change', (e) => {
+      if (this.ROT) return;
+      const id = e.target.dataset && e.target.dataset.tog; if (!id) return;
+      const task = this.currentTasks().find((t) => t.id === id);
+      if (task) { task.toggle(e.target.checked, this.book); this.commit('todo'); }
+    });
+    document.querySelector('.tabs').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-f]'); if (!b) return;
+      this.filter = b.dataset.f;
+      document.querySelectorAll('.tabs button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      this.renderTasks(); this.applyRO();
+    });
+    $('nav').addEventListener('click', (e) => { const b = e.target.closest('[data-page]'); if (b) this.navigate(b.dataset.page); });
+    $('appView').addEventListener('click', (e) => {
+      const g = e.target.closest('[data-go]'); if (g) { this.navigate(g.dataset.go); return; }
+      const hs = e.target.closest('[data-homesub]'); if (hs) { this.active = hs.dataset.homesub; this.renderSubjects(); this.renderDetail(); this.applyRO(); this.navigate('grades'); }
+    });
+    $('tourBtn').addEventListener('click', () => this.startTour());
+    $('tourNext').addEventListener('click', () => this.tour.next());
+    $('tourBack').addEventListener('click', () => this.tour.back());
+    $('tourSkip').addEventListener('click', () => this.tour.close());
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && this.tour.isOpen) this.tour.close(); });
+
+    $('loginBody').addEventListener('click', (e) => {
+      const r = e.target.closest('[data-role]');
+      if (r) { this.loginRole = r.dataset.role; this.loginErr = ''; this.renderLoginBody(true); return; }
+      if (e.target.id === 'lmodeToggle') { this.localMode = this.localMode === 'login' ? 'signup' : 'login'; this.loginErr = ''; this.renderLoginBody(true); return; }
+      if (e.target.id === 'modeToggle') { this.studentMode = this.studentMode === 'login' ? 'signup' : 'login'; this.loginErr = ''; this.renderLoginBody(true); }
+    });
+    $('loginBody').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const map = { createForm: 'onCreate', tLoginForm: 'onTeacherLogin', sLoginForm: 'onStudentLogin', sSignupForm: 'onSignup', lLoginForm: 'onLocalLogin', lSignupForm: 'onLocalSignup' };
+      const fn = map[e.target.id]; if (fn) this[fn]();
+    });
+    $('profileForm').addEventListener('submit', (e) => { e.preventDefault(); this.onProfile(); });
+    $('meOut').addEventListener('click', () => this.leave());
+    $('meBar').addEventListener('click', (e) => { if (e.target.closest('[data-act="back"]')) this.setView(null, 'home'); });
+    $('teacherBox').addEventListener('click', (e) => {
+      const v = e.target.closest('[data-view]'); if (v) { this.setView(v.dataset.view, 'grades'); return; }
+      const rs = e.target.closest('[data-reset]');
+      if (rs) { this.svc.resetPin(rs.dataset.reset).catch(() => this.msg('Could not reset the PIN.')); return; }
+      const d = e.target.closest('[data-dela]');
+      if (d) this.svc.removeAssignment(d.dataset.dela).catch(() => this.msg('Could not delete.'));
+    });
+    $('teacherBox').addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (e.target.id === 'addAssign') {
+        const t = $('aTitle').value.trim(); if (!t) return;
+        this.svc.postAssignment({ title: t, due: $('aDue').value, subject: $('aSubj').value.trim() }).catch(() => this.msg('Could not post the assignment.'));
+        $('aTitle').value = '';
+      }
+    });
+
+    const net = () => { const n = $('net'), on = navigator.onLine !== false; n.textContent = on ? 'Online' : 'Offline, saved on this device'; n.className = 'net' + (on ? '' : ' off'); };
+    window.addEventListener('online', net); window.addEventListener('offline', net); net();
+  }
+
+  saveFail() { this.loginErr = 'Could not save. Ask the owner of the page for Contributor access.'; this.renderLoginBody(true); }
+  validPin(v) { if (/^\d{4}$/.test(v)) return true; this.loginErr = 'The PIN is exactly 4 digits.'; this.renderLoginBody(true); return false; }
+  onCreate() {
+    const cn = $('cName').value.trim(), tn = $('cTeacher').value.trim(), pin = $('cPin').value.trim();
+    if (!cn || !tn || !this.validPin(pin)) return;
+    this.svc.createClassroom(cn, tn, pin).then((id) => this.identify(id),
+      (err) => { if (err && err.message === 'exists') { this.loginErr = 'A classroom already exists. Log in as the teacher instead.'; this.renderLoginBody(true); } else this.saveFail(); });
+  }
+  onTeacherLogin() {
+    if (this.locked()) return;
+    const pin = $('tPin').value.trim(); if (!this.validPin(pin)) return;
+    this.svc.verifyTeacher(pin).then((id) => this.identify(id), (err) => { if (err && err.message === 'bad') this.failLogin(); else this.saveFail(); });
+  }
+  onStudentLogin() {
+    if (this.locked()) return;
+    const name = $('sName').value.trim(), num = $('sNum').value.trim(), pin = $('sPin').value.trim();
+    if (!name || !num || !this.validPin(pin)) return;
+    this.svc.verifyStudent(name, num, pin).then((id) => this.identify(id), (err) => { if (err && err.message === 'bad') this.failLogin(); else this.saveFail(); });
+  }
+  onSignup() {
+    const f = { name: $('uName').value.trim(), number: $('uNum').value.trim(), pin: $('uPin').value.trim(), age: +$('uAge').value,
+      year: $('uYear').value.trim(), section: $('uSection').value.trim(), address: $('uAddr').value.trim() };
+    if (!f.name || !f.number || !(f.age > 0) || !f.year || !f.section || !f.address || !this.validPin(f.pin)) return;
+    this.svc.registerStudent(f).then((id) => { this.justJoined = true; this.identify(id); },
+      (err) => { if (err && err.message === 'exists') { this.loginErr = 'An account with that name and student number already exists. Log in instead.'; this.renderLoginBody(true); } else this.saveFail(); });
+  }
+  onLocalLogin() {
+    if (this.locked()) return;
+    const name = $('lName').value.trim(), pin = $('lPin').value.trim();
+    if (!name || !this.validPin(pin)) return;
+    this.auth.verify(name, pin).then((id) => this.identifyLocal(id), () => this.failLogin());
+  }
+  onLocalSignup() {
+    const name = $('gName').value.trim(), pin = $('gPin').value.trim();
+    if (!name || !this.validPin(pin)) return;
+    this.auth.create(name, pin).then((id) => { this.justJoined = true; this.identifyLocal(id); }, (err) => {
+      const m = err && err.message;
+      this.loginErr = m === 'exists' ? 'An account with that name already exists on this device. Log in instead.'
+        : m === 'storage' ? 'This browser is blocking site data, so accounts cannot be saved. Allow site data and try again.' : 'Could not create the account.';
+      this.renderLoginBody(true);
+    });
+  }
+  onProfile() {
+    if (!this.svc || !this.me) return;
+    const f = { name: $('pfName').value.trim(), age: +$('pfAge').value, year: $('pfYear').value.trim(), section: $('pfSection').value.trim(), address: $('pfAddr').value.trim() };
+    if (!f.name || !(f.age > 0) || !f.year || !f.section || !f.address) return;
+    this.svc.updateProfile(this.me.id, f).then(() => {
+      this.svc.members[this.me.id] = Object.assign({}, this.svc.members[this.me.id], f, { nameLower: f.name.toLowerCase() });
+      this.me = this.svc.person(this.me.id);
+      $('pfNote').textContent = 'Saved.'; this.renderShell();
+    }, () => { $('pfNote').textContent = 'Could not save. Ask the owner of the page for Contributor access.'; });
+  }
+  tryLocalAutoLogin() {
+    let id = '';
+    try { id = sessionStorage.getItem(App.LME) || ''; } catch (e) { /* ignore */ }
+    if (id && this.auth.person(id)) this.identifyLocal(id);
+  }
+  tryAutoLogin() {
+    const svc = this.svc;
+    if (this.me || !svc || !svc.loaded.members || !svc.loaded.classroom) return;
+    let id = '';
+    try { id = sessionStorage.getItem(App.ME) || ''; } catch (e) { /* ignore */ }
+    if (id && svc.members[id]) this.identify(id);
+  }
+
+  /* --- live updates from the shared database --- */
+  onChange(kind) {
+    const svc = this.svc;
+    if (kind === 'members' || kind === 'classroom') {
+      this.tryAutoLogin();
+      if (this.me && kind === 'members' && !svc.members[this.me.id]) { this.leave(); return; }
+      this.renderClass();
+    } else if (kind === 'assignments') {
+      this.renderStats(); this.renderHome(); this.renderTasks(); this.applyRO(); this.renderTeacher();
+    } else if (kind === 'records' || kind === 'todo') {
+      if (this.viewId && !this.store.busy) {
+        const incoming = svc.recordFor(this.viewId);
+        if (JSON.stringify(incoming) !== JSON.stringify(this.book)) {
+          this.book = incoming;
+          if (!this.subject) this.active = this.book.subjects.length ? this.book.subjects[0].id : null;
+          this.renderAll();
+        }
+      }
+      this.renderTeacher(); this.renderStats(); this.renderHome();
+    }
+  }
+
+  async boot() {
+    try {
+      if (!(window.claude && window.claude.use)) return;
+      const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
+      if (!db) return;
+      if (user) { try { this.canWrite = (await user.can('data.write')) !== false; } catch (e) { this.canWrite = true; } }
+      this.svc = new ClassroomService(db);
+      this.svc.start((kind) => this.onChange(kind), () => this.msg('The classroom could not load. Try again in a moment.'));
+    } catch (e) { this.svc = null; }
+    finally { this.booted = true; if (!this.svc) this.tryLocalAutoLogin(); this.renderClass(); }
+  }
+
+  start() {
+    $('tDue').value = Dates.plus(3); $('qDue').value = Dates.plus(3);
+    this.wire();
+    this.renderAll(); this.renderClass();
+    this.boot();
+  }
+}
+
+new App().start();
+})();
